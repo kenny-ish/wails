@@ -162,7 +162,7 @@ func (p *Provider) Check(ctx context.Context, req updater.CheckRequest) (*update
 
 	// Stash the download URL on Metadata so Download can find it without
 	// re-querying the API.
-	out.Metadata["github.asset.url"] = picked.BrowserDownloadURL
+	out.Metadata["github.asset.url"] = p.downloadURL(picked)
 
 	// Optional verification via a sibling checksum asset.
 	if p.cfg.ChecksumAsset != "" {
@@ -270,6 +270,19 @@ func (p *Provider) setAuth(req *http.Request) {
 	}
 }
 
+// downloadURL returns the URL to fetch an asset's bytes from. With a token
+// configured this is the asset's API URL (/repos/{r}/releases/assets/{id}),
+// which honours the Authorization header and so works for private
+// repositories; browser_download_url ignores the token and returns 404 for
+// them. Without a token the browser URL is used so public downloads do not
+// count against the unauthenticated API rate limit.
+func (p *Provider) downloadURL(a apiAsset) string {
+	if p.cfg.Token != "" && a.URL != "" {
+		return a.URL
+	}
+	return a.BrowserDownloadURL
+}
+
 func (p *Provider) fetchRelease(ctx context.Context, endpoint string) (*apiRelease, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -323,7 +336,7 @@ func (p *Provider) fetchChecksumFor(ctx context.Context, assets []apiAsset, side
 	if idx < 0 {
 		return nil, nil
 	}
-	urlStr := assets[idx].BrowserDownloadURL
+	urlStr := p.downloadURL(assets[idx])
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
 	if err != nil {
 		return nil, err
@@ -495,5 +508,6 @@ type apiAsset struct {
 	Name               string `json:"name"`
 	ContentType        string `json:"content_type"`
 	Size               int64  `json:"size"`
+	URL                string `json:"url"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 }

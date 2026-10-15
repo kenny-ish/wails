@@ -281,6 +281,122 @@ func TestDownload_FollowsRedirect_StripsAuth(t *testing.T) {
 	}
 }
 
+// privateRepoServer mimics GitHub for a private repository: the asset API
+// URL serves the bytes when the request carries the token, while
+// browser_download_url answers 404 regardless of the Authorization header.
+func privateRepoServer(t *testing.T, body []byte) (srv *httptest.Server, apiHits, browserHits *int32) {
+	t.Helper()
+	apiHits, browserHits = new(int32), new(int32)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{
+		  "tag_name": "v2.0.0",
+		  "assets": [
+		    {"id": 7, "name": "app-linux-amd64.tar.gz", "content_type": "application/gzip", "size": %d,
+		     "url": "%s/repos/o/r/releases/assets/7", "browser_download_url": "%s/dl/app-linux-amd64.tar.gz"},
+		    {"id": 8, "name": "SHA256SUMS", "content_type": "text/plain", "size": 64,
+		     "url": "%s/repos/o/r/releases/assets/8", "browser_download_url": "%s/dl/SHA256SUMS"}
+		  ]
+		}`, len(body), srv.URL, srv.URL, srv.URL, srv.URL)
+	})
+	mux.HandleFunc("/repos/o/r/releases/assets/", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(apiHits, 1)
+		if r.Header.Get("Authorization") != "Bearer ghp_secret" || r.Header.Get("Accept") != "application/octet-stream" {
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/8") {
+			sum := sha256.Sum256(body)
+			fmt.Fprintf(w, "%s  app-linux-amd64.tar.gz\n", hex.EncodeToString(sum[:]))
+			return
+		}
+		w.Write(body)
+	})
+	mux.HandleFunc("/dl/", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(browserHits, 1)
+		http.Error(w, "Not Found", http.StatusNotFound)
+	})
+	srv = httptest.NewServer(mux)
+	return srv, apiHits, browserHits
+}
+
+func TestDownload_PrivateRepo_UsesAssetAPIURL(t *testing.T) {
+	body := []byte("private-bytes")
+	srv, apiHits, browserHits := privateRepoServer(t, body)
+	defer srv.Close()
+
+	p, err := github.New(github.Config{Repository: "o/r", Token: "ghp_secret", BaseURL: srv.URL, ChecksumAsset: "SHA256SUMS"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel, err := p.Check(context.Background(), updater.CheckRequest{
+		CurrentVersion: "1.0.0",
+		Platform:       "linux",
+		Arch:           "amd64",
+	})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if rel == nil {
+		t.Fatal("expected release, got nil")
+	}
+	if rel.Verification == nil {
+		t.Fatal("expected checksum verification from the sidecar")
+	}
+	var got bytes.Buffer
+	if err := p.Download(context.Background(), rel, &got, nil); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if !bytes.Equal(got.Bytes(), body) {
+		t.Errorf("bytes: %q", got.Bytes())
+	}
+	if n := atomic.LoadInt32(apiHits); n != 2 {
+		t.Errorf("asset API hits: want 2 (sidecar + asset), got %d", n)
+	}
+	if n := atomic.LoadInt32(browserHits); n != 0 {
+		t.Errorf("browser_download_url hits: want 0, got %d", n)
+	}
+}
+
+func TestDownload_NoToken_UsesBrowserDownloadURL(t *testing.T) {
+	var apiHits, browserHits int32
+	mux := http.NewServeMux()
+	var host string
+	mux.HandleFunc("/repos/o/r/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"tag_name": "v2.0.0", "assets": [
+		  {"id": 7, "name": "app-linux-amd64.tar.gz", "size": 5,
+		   "url": "%s/repos/o/r/releases/assets/7", "browser_download_url": "%s/dl/app-linux-amd64.tar.gz"}
+		]}`, host, host)
+	})
+	mux.HandleFunc("/repos/o/r/releases/assets/", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&apiHits, 1)
+		w.Write([]byte("bytes"))
+	})
+	mux.HandleFunc("/dl/", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&browserHits, 1)
+		w.Write([]byte("bytes"))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	host = srv.URL
+
+	p, _ := github.New(github.Config{Repository: "o/r", BaseURL: srv.URL})
+	rel, err := p.Check(context.Background(), updater.CheckRequest{CurrentVersion: "1.0.0", Platform: "linux", Arch: "amd64"})
+	if err != nil || rel == nil {
+		t.Fatalf("Check: rel=%v err=%v", rel, err)
+	}
+	var got bytes.Buffer
+	if err := p.Download(context.Background(), rel, &got, nil); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if n := atomic.LoadInt32(&browserHits); n != 1 {
+		t.Errorf("browser_download_url hits: want 1, got %d", n)
+	}
+	if n := atomic.LoadInt32(&apiHits); n != 0 {
+		t.Errorf("asset API hits: want 0, got %d", n)
+	}
+}
+
 func TestNew_RequiresRepository(t *testing.T) {
 	if _, err := github.New(github.Config{}); err == nil {
 		t.Fatal("expected error")
